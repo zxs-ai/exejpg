@@ -43,6 +43,7 @@ func main() {
 	case "/uninstall", "-uninstall", "--uninstall":
 		doUninstall()
 	case "/embedding", "-embedding":
+		// 兼容旧版 COM 注册；新版以经典右键为主
 		runCOMServer()
 	case "/process-list":
 		if len(args) >= 2 {
@@ -95,11 +96,20 @@ func doInstall() {
 		os.Exit(1)
 	}
 
-	messageBox("安装成功！\n\n选中任意数量的图片后右键可见：「"+menuCaption+"」\n\n同名 JPG+CR3 才复制；处理时显示进度条。\n\n卸载：\n"+dstExe+" /uninstall", appName)
+	notifyShellAssocChanged()
+
+	messageBox("安装成功！（兼容 Windows 10 / 11）\n\n"+
+		"选中图片后右键 → 「"+menuCaption+"」\n\n"+
+		"若 Win11 默认右键看不到：\n"+
+		"· 点「显示更多选项」，或\n"+
+		"· 按住 Shift 再右键\n\n"+
+		"建议关闭并重新打开资源管理器窗口后再试。\n\n"+
+		"卸载：\n"+dstExe+" /uninstall", appName)
 }
 
 func doUninstall() {
 	_ = unregisterContextMenu()
+	notifyShellAssocChanged()
 	dstDir := filepath.Join(os.Getenv("LOCALAPPDATA"), "CopyPairFolder")
 	_ = os.RemoveAll(dstDir)
 	messageBox("已卸载右键菜单「"+menuCaption+"」。", appName)
@@ -108,23 +118,31 @@ func doUninstall() {
 func registerContextMenu(exePath string) error {
 	_ = unregisterContextMenu()
 
-	base := `HKCU\Software\Classes\*\shell\` + regKeyName
-	clsidKey := `HKCU\Software\Classes\CLSID\` + comClassID
-	localServer := fmt.Sprintf(`"%s" /Embedding`, exePath)
-
-	cmds := [][]string{
-		{"reg", "add", base, "/ve", "/d", menuCaption, "/f"},
-		{"reg", "add", base, "/v", "Icon", "/d", exePath, "/f"},
-		{"reg", "add", base, "/v", "MultiSelectModel", "/d", "Player", "/f"},
-		{"reg", "add", base + `\command`, "/v", "DelegateExecute", "/d", comClassID, "/f"},
-		{"reg", "add", clsidKey, "/ve", "/d", appName, "/f"},
-		{"reg", "add", clsidKey + `\LocalServer32`, "/ve", "/d", localServer, "/f"},
-		{"reg", "add", clsidKey + `\LocalServer32`, "/v", "ServerExecutable", "/d", exePath, "/f"},
+	// Win10/11 兼容：使用经典 command（不用 DelegateExecute）。
+	// Win11 上 COM 右键经常点了没反应；经典命令 + 会话锁更稳。
+	cmd := fmt.Sprintf(`"%s" "%%1"`, exePath)
+	bases := []string{
+		`HKCU\Software\Classes\*\shell\` + regKeyName,
+		`HKCU\Software\Classes\SystemFileAssociations\image\shell\` + regKeyName,
+		`HKCU\Software\Classes\SystemFileAssociations\.jpg\shell\` + regKeyName,
+		`HKCU\Software\Classes\SystemFileAssociations\.jpeg\shell\` + regKeyName,
+		`HKCU\Software\Classes\SystemFileAssociations\.jpe\shell\` + regKeyName,
+		`HKCU\Software\Classes\SystemFileAssociations\.cr3\shell\` + regKeyName,
 	}
-	for _, c := range cmds {
-		out, err := exec.Command(c[0], c[1:]...).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("%v: %s", err, string(out))
+
+	for _, base := range bases {
+		cmds := [][]string{
+			{"reg", "add", base, "/ve", "/d", menuCaption, "/f"},
+			{"reg", "add", base, "/v", "Icon", "/d", exePath, "/f"},
+			{"reg", "add", base, "/v", "MultiSelectModel", "/d", "Player", "/f"},
+			{"reg", "add", base, "/v", "Position", "/d", "Top", "/f"},
+			{"reg", "add", base + `\command`, "/ve", "/d", cmd, "/f"},
+		}
+		for _, c := range cmds {
+			out, err := exec.Command(c[0], c[1:]...).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("%v: %s", err, string(out))
+			}
 		}
 	}
 	return nil
@@ -134,12 +152,25 @@ func unregisterContextMenu() error {
 	keys := []string{
 		`HKCU\Software\Classes\*\shell\` + regKeyName,
 		`HKCU\Software\Classes\SystemFileAssociations\image\shell\` + regKeyName,
+		`HKCU\Software\Classes\SystemFileAssociations\.jpg\shell\` + regKeyName,
+		`HKCU\Software\Classes\SystemFileAssociations\.jpeg\shell\` + regKeyName,
+		`HKCU\Software\Classes\SystemFileAssociations\.jpe\shell\` + regKeyName,
+		`HKCU\Software\Classes\SystemFileAssociations\.cr3\shell\` + regKeyName,
 		`HKCU\Software\Classes\CLSID\` + comClassID,
+		`HKCU\Software\Classes\AppID\` + comClassID,
 	}
 	for _, k := range keys {
 		_ = exec.Command("reg", "delete", k, "/f").Run()
 	}
 	return nil
+}
+
+func notifyShellAssocChanged() {
+	shell32 := syscall.NewLazyDLL("shell32.dll")
+	proc := shell32.NewProc("SHChangeNotify")
+	const SHCNE_ASSOCCHANGED = 0x08000000
+	const SHCNF_IDLIST = 0x0000
+	_, _, _ = proc.Call(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0)
 }
 
 func stateDir() string {
@@ -168,8 +199,8 @@ func runCopy(args []string) {
 	// 领导进程：保持 session 文件到结束（含弹窗期间），防止逐个启动的后续进程再跑一遍
 	defer touchSession(sessionFile)
 
-	// 等并行启动的进程写完 pending；并给资源管理器一点时间保持多选状态
-	time.Sleep(600 * time.Millisecond)
+	// 等并行启动的进程写完 pending；Win11 资源管理器稍慢，多等一会
+	time.Sleep(900 * time.Millisecond)
 
 	selected := getExplorerSelection(clicked)
 	selected = append(selected, readPending(listFile)...)
