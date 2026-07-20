@@ -4,30 +4,16 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
-	"unsafe"
-
-	"golang.org/x/sys/windows"
 )
 
 const (
 	appName     = "复制并新建文件夹"
-	exeName     = "CopyPairFolder.exe"
-	regKeyName  = "CopyPairFolder"
 	menuCaption = "复制并新建文件夹"
-	mutexName   = "Local\\CopyPairFolder_Leader_v5"
-	// 资源管理器多选时常按文件逐个启动；同一操作窗口期内只允许跑一次
+	// Finder / 资源管理器多选时常按文件逐个启动；同一操作窗口期内只允许跑一次
 	sessionCooldown = 8 * time.Second
-)
-
-var (
-	user32          = syscall.NewLazyDLL("user32.dll")
-	procMessageBoxW = user32.NewProc("MessageBoxW")
-	leaderMutex     windows.Handle // 进程存活期间持有，防止后续实例再成为领导
 )
 
 func main() {
@@ -43,7 +29,7 @@ func main() {
 	case "/uninstall", "-uninstall", "--uninstall":
 		doUninstall()
 	case "/embedding", "-embedding":
-		// 兼容旧版 COM 注册；新版以经典右键为主
+		// 兼容旧版 Windows COM 注册；新版以经典右键为主
 		runCOMServer()
 	case "/process-list":
 		if len(args) >= 2 {
@@ -57,126 +43,7 @@ func main() {
 }
 
 func showHelp() {
-	msg := appName + "\n\n" +
-		"双击本程序 = 安装右键菜单\n" +
-		"卸载：CopyPairFolder.exe /uninstall\n\n" +
-		"功能：仅复制「同名且同时存在 JPG 与 CR3」的配对到当前目录下的新文件夹。\n" +
-		"扩展名大小写均可。"
-	messageBox(msg, appName)
-}
-
-func doInstall() {
-	dstDir := filepath.Join(os.Getenv("LOCALAPPDATA"), "CopyPairFolder")
-	if err := os.MkdirAll(dstDir, 0755); err != nil {
-		messageBox("安装失败：无法创建目录\n"+err.Error(), appName)
-		os.Exit(1)
-	}
-
-	self, err := os.Executable()
-	if err != nil {
-		messageBox("安装失败：无法定位自身\n"+err.Error(), appName)
-		os.Exit(1)
-	}
-	self, _ = filepath.Abs(self)
-	dstExe := filepath.Join(dstDir, exeName)
-
-	if !sameFile(self, dstExe) {
-		if err := copyFile(self, dstExe); err != nil {
-			messageBox("安装失败：无法复制程序\n"+err.Error(), appName)
-			os.Exit(1)
-		}
-	}
-
-	if err := registerContextMenu(dstExe); err != nil {
-		messageBox("安装失败：无法写入右键菜单\n"+err.Error(), appName)
-		os.Exit(1)
-	}
-	if err := installProgressScript(dstDir); err != nil {
-		messageBox("安装失败：无法安装进度窗口\n"+err.Error(), appName)
-		os.Exit(1)
-	}
-
-	notifyShellAssocChanged()
-
-	messageBox("安装成功！（兼容 Windows 10 / 11）\n\n"+
-		"选中图片后右键 → 「"+menuCaption+"」\n\n"+
-		"若 Win11 默认右键看不到：\n"+
-		"· 点「显示更多选项」，或\n"+
-		"· 按住 Shift 再右键\n\n"+
-		"建议关闭并重新打开资源管理器窗口后再试。\n\n"+
-		"卸载：\n"+dstExe+" /uninstall", appName)
-}
-
-func doUninstall() {
-	_ = unregisterContextMenu()
-	notifyShellAssocChanged()
-	dstDir := filepath.Join(os.Getenv("LOCALAPPDATA"), "CopyPairFolder")
-	_ = os.RemoveAll(dstDir)
-	messageBox("已卸载右键菜单「"+menuCaption+"」。", appName)
-}
-
-func registerContextMenu(exePath string) error {
-	_ = unregisterContextMenu()
-
-	// Win10/11 兼容：使用经典 command（不用 DelegateExecute）。
-	// Win11 上 COM 右键经常点了没反应；经典命令 + 会话锁更稳。
-	cmd := fmt.Sprintf(`"%s" "%%1"`, exePath)
-	bases := []string{
-		`HKCU\Software\Classes\*\shell\` + regKeyName,
-		`HKCU\Software\Classes\SystemFileAssociations\image\shell\` + regKeyName,
-		`HKCU\Software\Classes\SystemFileAssociations\.jpg\shell\` + regKeyName,
-		`HKCU\Software\Classes\SystemFileAssociations\.jpeg\shell\` + regKeyName,
-		`HKCU\Software\Classes\SystemFileAssociations\.jpe\shell\` + regKeyName,
-		`HKCU\Software\Classes\SystemFileAssociations\.cr3\shell\` + regKeyName,
-	}
-
-	for _, base := range bases {
-		cmds := [][]string{
-			{"reg", "add", base, "/ve", "/d", menuCaption, "/f"},
-			{"reg", "add", base, "/v", "Icon", "/d", exePath, "/f"},
-			{"reg", "add", base, "/v", "MultiSelectModel", "/d", "Player", "/f"},
-			{"reg", "add", base, "/v", "Position", "/d", "Top", "/f"},
-			{"reg", "add", base + `\command`, "/ve", "/d", cmd, "/f"},
-		}
-		for _, c := range cmds {
-			out, err := exec.Command(c[0], c[1:]...).CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("%v: %s", err, string(out))
-			}
-		}
-	}
-	return nil
-}
-
-func unregisterContextMenu() error {
-	keys := []string{
-		`HKCU\Software\Classes\*\shell\` + regKeyName,
-		`HKCU\Software\Classes\SystemFileAssociations\image\shell\` + regKeyName,
-		`HKCU\Software\Classes\SystemFileAssociations\.jpg\shell\` + regKeyName,
-		`HKCU\Software\Classes\SystemFileAssociations\.jpeg\shell\` + regKeyName,
-		`HKCU\Software\Classes\SystemFileAssociations\.jpe\shell\` + regKeyName,
-		`HKCU\Software\Classes\SystemFileAssociations\.cr3\shell\` + regKeyName,
-		`HKCU\Software\Classes\CLSID\` + comClassID,
-		`HKCU\Software\Classes\AppID\` + comClassID,
-	}
-	for _, k := range keys {
-		_ = exec.Command("reg", "delete", k, "/f").Run()
-	}
-	return nil
-}
-
-func notifyShellAssocChanged() {
-	shell32 := syscall.NewLazyDLL("shell32.dll")
-	proc := shell32.NewProc("SHChangeNotify")
-	const SHCNE_ASSOCCHANGED = 0x08000000
-	const SHCNF_IDLIST = 0x0000
-	_, _, _ = proc.Call(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0)
-}
-
-func stateDir() string {
-	d := filepath.Join(os.Getenv("LOCALAPPDATA"), "CopyPairFolder", "run")
-	_ = os.MkdirAll(d, 0755)
-	return d
+	messageBox(helpText(), appName)
 }
 
 func runCopy(args []string) {
@@ -189,20 +56,16 @@ func runCopy(args []string) {
 	listFile := filepath.Join(stateDir(), "pending_files.txt")
 	sessionFile := filepath.Join(stateDir(), "session.active")
 
-	// 先记下本进程收到的文件（静默）
 	appendPending(listFile, clicked)
 
-	// 同一轮右键操作里，后续被逐个拉起的进程全部静默退出，绝不弹窗
 	if !tryBecomeLeader(sessionFile) {
 		os.Exit(0)
 	}
-	// 领导进程：保持 session 文件到结束（含弹窗期间），防止逐个启动的后续进程再跑一遍
 	defer touchSession(sessionFile)
 
-	// 等并行启动的进程写完 pending；Win11 资源管理器稍慢，多等一会
-	time.Sleep(900 * time.Millisecond)
+	time.Sleep(selectionSettleDelay())
 
-	selected := getExplorerSelection(clicked)
+	selected := getSelection(clicked)
 	selected = append(selected, readPending(listFile)...)
 	selected = append(selected, collectArgsFiles(args)...)
 	_ = os.Remove(listFile)
@@ -229,7 +92,7 @@ func runCopyFromList(listPath string) {
 
 func processSelected(files []string) {
 	if len(files) == 0 {
-		messageBox("未获取到选中的文件。\n\n请重新选中后右键再试。", appName)
+		messageBox("未获取到选中的文件。\n\n请重新选中后再试。", appName)
 		return
 	}
 
@@ -266,7 +129,7 @@ func processSelected(files []string) {
 			dst := filepath.Join(destDir, filepath.Base(src))
 			name := filepath.Base(src)
 			progress.Update(copied, copiedBytes, name)
-			n, err := copyFileWithProgress(src, dst, func(delta int64) {
+			_, err := copyFileWithProgress(src, dst, func(delta int64) {
 				copiedBytes += delta
 				progress.Update(copied, copiedBytes, name)
 			})
@@ -274,7 +137,6 @@ func processSelected(files []string) {
 				messageBox("复制失败：\n"+err.Error(), appName)
 				return
 			}
-			_ = n
 			copied++
 			progress.Update(copied, copiedBytes, "")
 		}
@@ -284,43 +146,6 @@ func processSelected(files []string) {
 	openAndRenameFolder(destDir)
 	messageBox(fmt.Sprintf("完成！\n\n配对组数：%d\n复制文件：%d\n新文件夹：%s",
 		len(pairs), copied, destDir), appName)
-}
-
-// tryBecomeLeader：整轮操作只允许一个进程执行并弹窗。
-// 覆盖两种情况：1) 同时启动多个  2) 等上一个退出后再启动下一个
-func tryBecomeLeader(sessionFile string) bool {
-	// 冷却期内已有会话 → 静默退出（解决「按文件逐个启动」）
-	if st, err := os.Stat(sessionFile); err == nil {
-		if time.Since(st.ModTime()) < sessionCooldown {
-			return false
-		}
-		_ = os.Remove(sessionFile)
-	}
-
-	// 命名互斥量：并发时只有创建者成为领导
-	name, err := windows.UTF16PtrFromString(mutexName)
-	if err != nil {
-		return claimSessionFile(sessionFile)
-	}
-	h, err := windows.CreateMutex(nil, true, name)
-	if err == windows.ERROR_ALREADY_EXISTS {
-		_ = windows.CloseHandle(h)
-		return false
-	}
-	if err != nil {
-		return claimSessionFile(sessionFile)
-	}
-
-	// 创建成功并拥有所有权 → 再占 session 文件
-	if !claimSessionFile(sessionFile) {
-		_ = windows.ReleaseMutex(h)
-		_ = windows.CloseHandle(h)
-		return false
-	}
-
-	// 弹窗期间也持有，进程退出时由系统回收
-	leaderMutex = h
-	return true
 }
 
 func claimSessionFile(sessionFile string) bool {
@@ -508,97 +333,6 @@ func findJpgCr3Pairs(selected []string, dir string) map[string][]string {
 	return out
 }
 
-func getExplorerSelection(hint string) []string {
-	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("cpf_sel_%d.txt", time.Now().UnixNano()))
-	defer os.Remove(tmp)
-
-	ps := `
-$ErrorActionPreference = 'SilentlyContinue'
-$hint = [System.IO.Path]::GetFullPath('` + escapePS(hint) + `')
-$hintDir = [System.IO.Path]::GetDirectoryName($hint)
-$outFile = '` + escapePS(tmp) + `'
-$shell = New-Object -ComObject Shell.Application
-$best = New-Object System.Collections.Generic.List[string]
-$fallback = New-Object System.Collections.Generic.List[string]
-foreach ($w in $shell.Windows()) {
-  try {
-    if ($null -eq $w.Document) { continue }
-    $folderPath = $null
-    try { $folderPath = $w.Document.Folder.Self.Path } catch {}
-    $items = @($w.Document.SelectedItems())
-    if ($items.Count -eq 0) { continue }
-    $paths = New-Object System.Collections.Generic.List[string]
-    foreach ($it in $items) {
-      if ($it.Path) { [void]$paths.Add([string]$it.Path) }
-    }
-    if ($paths.Count -eq 0) { continue }
-    $fallback = $paths
-    $hit = $false
-    foreach ($p in $paths) {
-      if ([string]::Equals($p, $hint, [System.StringComparison]::OrdinalIgnoreCase)) { $hit = $true; break }
-    }
-    if (-not $hit -and $folderPath -and $hintDir -and [string]::Equals($folderPath, $hintDir, [System.StringComparison]::OrdinalIgnoreCase)) {
-      $hit = $true
-    }
-    if ($hit) { $best = $paths; break }
-  } catch {}
-}
-$result = $best
-if ($result.Count -eq 0) { $result = $fallback }
-$utf8 = New-Object System.Text.UTF8Encoding $false
-[System.IO.File]::WriteAllLines($outFile, $result.ToArray(), $utf8)
-`
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	_ = cmd.Run()
-
-	data, err := os.ReadFile(tmp)
-	if err != nil {
-		return nil
-	}
-	text := strings.TrimPrefix(string(data), "\ufeff")
-	var res []string
-	for _, ln := range strings.Split(text, "\n") {
-		ln = strings.TrimSpace(strings.TrimRight(ln, "\r"))
-		if ln != "" {
-			res = append(res, ln)
-		}
-	}
-	return res
-}
-
-func escapePS(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
-}
-
-func openAndRenameFolder(folder string) {
-	parent := filepath.Dir(folder)
-	_ = exec.Command("explorer", "/select,", folder).Start()
-
-	ps := `
-Start-Sleep -Milliseconds 900
-$folder = '` + escapePS(folder) + `'
-$parent = '` + escapePS(parent) + `'
-$shell = New-Object -ComObject Shell.Application
-foreach ($w in $shell.Windows()) {
-  try {
-    if ($w.Document.Folder.Self.Path -eq $parent) {
-      $w.Document.SelectItem($folder, 1+4+8+16)
-      Start-Sleep -Milliseconds 200
-      $wshell = New-Object -ComObject WScript.Shell
-      $wshell.AppActivate($w.HWND) | Out-Null
-      Start-Sleep -Milliseconds 200
-      $wshell.SendKeys('{F2}')
-      break
-    }
-  } catch {}
-}
-`
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	_ = cmd.Start()
-}
-
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -662,10 +396,4 @@ func sameFile(a, b string) bool {
 	a, _ = filepath.Abs(a)
 	b, _ = filepath.Abs(b)
 	return strings.EqualFold(a, b)
-}
-
-func messageBox(text, caption string) {
-	t, _ := syscall.UTF16PtrFromString(text)
-	c, _ := syscall.UTF16PtrFromString(caption)
-	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(t)), uintptr(unsafe.Pointer(c)), 0x40)
 }

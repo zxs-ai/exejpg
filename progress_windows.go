@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -5,27 +7,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
 
 const progressScriptName = "progress.ps1"
 
-type progressWindow struct {
-	path       string
-	totalFiles int
-	totalBytes int64
-	lastWrite  time.Time
-	lastCopied int
-	finished   bool
-	mu         sync.Mutex
-}
+func progressFinishDelay() time.Duration { return 1200 * time.Millisecond }
+func progressCloseDelay() time.Duration  { return 700 * time.Millisecond }
 
 func installProgressScript(dstDir string) error {
-	// Windows PowerShell 5 对无 BOM 的脚本可能按系统代码页读取，写 BOM 保证中文正常。
 	data := append([]byte{0xEF, 0xBB, 0xBF}, []byte(progressPowerShell)...)
 	return os.WriteFile(filepath.Join(dstDir, progressScriptName), data, 0644)
 }
@@ -44,73 +35,6 @@ func startProgressWindow(totalFiles int, totalBytes int64) *progressWindow {
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	_ = cmd.Start()
 	return p
-}
-
-func (p *progressWindow) statusText(copied int, name string) string {
-	if name != "" {
-		return fmt.Sprintf("正在复制  共%d张，已复制%d张  %s", p.totalFiles, copied, name)
-	}
-	return fmt.Sprintf("正在复制  共%d张，已复制%d张", p.totalFiles, copied)
-}
-
-func (p *progressWindow) Update(copiedFiles int, copiedBytes int64, currentName string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.finished {
-		return
-	}
-
-	// 张数变化必须立刻刷新；字节进度可节流
-	force := copiedFiles != p.lastCopied
-	if !force && time.Since(p.lastWrite) < 80*time.Millisecond {
-		return
-	}
-
-	percent := 0
-	if p.totalBytes > 0 {
-		percent = int(copiedBytes * 100 / p.totalBytes)
-	} else if p.totalFiles > 0 {
-		percent = copiedFiles * 100 / p.totalFiles
-	}
-	if percent > 99 {
-		percent = 99
-	}
-	p.lastCopied = copiedFiles
-	p.writeState(percent, copiedFiles, p.statusText(copiedFiles, currentName))
-}
-
-func (p *progressWindow) Finish(copiedFiles int) {
-	p.mu.Lock()
-	if !p.finished {
-		p.lastCopied = copiedFiles
-		p.writeState(100, copiedFiles, fmt.Sprintf("复制完成  共%d张，已复制%d张", p.totalFiles, copiedFiles))
-		p.finished = true
-	}
-	p.mu.Unlock()
-	// 等进度窗读到 100% 并自行关闭
-	time.Sleep(1200 * time.Millisecond)
-}
-
-func (p *progressWindow) Close() {
-	p.mu.Lock()
-	// 无论是否已 Finish，都发关闭信号，避免窗口残留
-	p.writeRaw("-1\n关闭\n" + strconv.Itoa(p.totalFiles) + "\n" + strconv.Itoa(p.lastCopied))
-	p.finished = true
-	p.mu.Unlock()
-	time.Sleep(700 * time.Millisecond)
-	_ = os.Remove(p.path)
-}
-
-func (p *progressWindow) writeState(percent, copied int, status string) {
-	status = strings.ReplaceAll(status, "\r", " ")
-	status = strings.ReplaceAll(status, "\n", " ")
-	content := fmt.Sprintf("%d\n%s\n%d\n%d", percent, status, p.totalFiles, copied)
-	p.writeRaw(content)
-}
-
-func (p *progressWindow) writeRaw(content string) {
-	_ = os.WriteFile(p.path, []byte(content), 0644)
-	p.lastWrite = time.Now()
 }
 
 const progressPowerShell = `
