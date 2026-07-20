@@ -10,11 +10,40 @@ import (
 )
 
 const (
-	appName     = "复制并新建文件夹"
-	menuCaption = "复制并新建文件夹"
+	appName       = "配对文件夹工具"
+	menuCopyCaption = "复制并新建文件夹"
+	menuCutCaption  = "剪切并新建文件夹"
 	// Finder / 资源管理器多选时常按文件逐个启动；同一操作窗口期内只允许跑一次
 	sessionCooldown = 8 * time.Second
 )
+
+type transferMode int
+
+const (
+	modeCopy transferMode = iota
+	modeCut
+)
+
+func (m transferMode) String() string {
+	if m == modeCut {
+		return "cut"
+	}
+	return "copy"
+}
+
+func (m transferMode) verb() string {
+	if m == modeCut {
+		return "剪切"
+	}
+	return "复制"
+}
+
+func (m transferMode) menuCaption() string {
+	if m == modeCut {
+		return menuCutCaption
+	}
+	return menuCopyCaption
+}
 
 func main() {
 	args := os.Args[1:]
@@ -32,13 +61,34 @@ func main() {
 		// 兼容旧版 Windows COM 注册；新版以经典右键为主
 		runCOMServer()
 	case "/process-list":
-		if len(args) >= 2 {
-			runCopyFromList(args[1])
+		mode, rest := parseModeFlag(args[1:])
+		if len(rest) >= 1 {
+			runFromList(rest[0], mode)
 		}
+	case "/copy", "-copy", "--copy":
+		runTransfer(args[1:], modeCopy)
+	case "/cut", "-cut", "--cut":
+		runTransfer(args[1:], modeCut)
 	case "/help", "-h", "--help":
 		showHelp()
 	default:
-		runCopy(args)
+		// 无显式模式时：兼容旧版右键（仅复制）
+		mode, rest := parseModeFlag(args)
+		runTransfer(rest, mode)
+	}
+}
+
+func parseModeFlag(args []string) (transferMode, []string) {
+	if len(args) == 0 {
+		return modeCopy, args
+	}
+	switch strings.ToLower(args[0]) {
+	case "/copy", "-copy", "--copy", "copy":
+		return modeCopy, args[1:]
+	case "/cut", "-cut", "--cut", "cut":
+		return modeCut, args[1:]
+	default:
+		return modeCopy, args
 	}
 }
 
@@ -46,19 +96,22 @@ func showHelp() {
 	messageBox(helpText(), appName)
 }
 
-func runCopy(args []string) {
+func runTransfer(args []string, mode transferMode) {
+	if len(args) == 0 {
+		os.Exit(0)
+	}
 	clicked := strings.TrimSpace(args[0])
 	if clicked == "" {
 		os.Exit(0)
 	}
 	clicked, _ = filepath.Abs(clicked)
 
-	listFile := filepath.Join(stateDir(), "pending_files.txt")
-	sessionFile := filepath.Join(stateDir(), "session.active")
+	listFile := filepath.Join(stateDir(), "pending_"+mode.String()+".txt")
+	sessionFile := filepath.Join(stateDir(), "session_"+mode.String()+".active")
 
 	appendPending(listFile, clicked)
 
-	if !tryBecomeLeader(sessionFile) {
+	if !tryBecomeLeader(sessionFile, mode) {
 		os.Exit(0)
 	}
 	defer touchSession(sessionFile)
@@ -71,14 +124,14 @@ func runCopy(args []string) {
 	_ = os.Remove(listFile)
 
 	files := normalizeFiles(selected)
-	processSelected(files)
+	processSelected(files, mode)
 }
 
-func runCopyFromList(listPath string) {
+func runFromList(listPath string, mode transferMode) {
 	defer os.Remove(listPath)
 	data, err := os.ReadFile(listPath)
 	if err != nil {
-		messageBox("读取选中文件失败：\n"+err.Error(), appName)
+		messageBox("读取选中文件失败：\n"+err.Error(), mode.menuCaption())
 		return
 	}
 	var selected []string
@@ -87,65 +140,95 @@ func runCopyFromList(listPath string) {
 			selected = append(selected, line)
 		}
 	}
-	processSelected(normalizeFiles(selected))
+	processSelected(normalizeFiles(selected), mode)
 }
 
-func processSelected(files []string) {
+func processSelected(files []string, mode transferMode) {
+	caption := mode.menuCaption()
 	if len(files) == 0 {
-		messageBox("未获取到选中的文件。\n\n请重新选中后再试。", appName)
+		messageBox("未获取到选中的文件。\n\n请重新选中后再试。", caption)
 		return
 	}
 
 	dir := filepath.Dir(files[0])
 	pairs := findJpgCr3Pairs(files, dir)
 	if len(pairs) == 0 {
-		messageBox("未找到同时具备 JPG 与 CR3 的同名配对。\n\n只有一种格式的文件不会复制。", appName)
+		messageBox("未找到同时具备 JPG 与 CR3 的同名配对。\n\n只有一种格式的文件不会"+mode.verb()+"。", caption)
 		return
+	}
+
+	totalFiles := len(pairs) * 2
+	if mode == modeCut {
+		msg := fmt.Sprintf("将把 %d 组配对（共 %d 个文件）剪切到新文件夹。\n\n原位置的这些文件会被删除，是否继续？",
+			len(pairs), totalFiles)
+		if !confirmDialog(msg, caption) {
+			return
+		}
 	}
 
 	folderName := "配对导出_" + time.Now().Format("20060102_150405")
 	destDir := uniqueDir(filepath.Join(dir, folderName))
 	if err := os.MkdirAll(destDir, 0755); err != nil {
-		messageBox("创建文件夹失败：\n"+err.Error(), appName)
+		messageBox("创建文件夹失败：\n"+err.Error(), caption)
 		return
 	}
 
 	totalBytes := int64(0)
+	var sources []string
 	for _, paths := range pairs {
 		for _, src := range paths {
+			sources = append(sources, src)
 			if st, err := os.Stat(src); err == nil {
 				totalBytes += st.Size()
 			}
 		}
 	}
-	totalCopy := len(pairs) * 2
-	progress := startProgressWindow(totalCopy, totalBytes)
+
+	progress := startProgressWindow(totalFiles, totalBytes, mode)
 	defer progress.Close()
 
-	copied := 0
-	var copiedBytes int64
-	for _, paths := range pairs {
-		for _, src := range paths {
-			dst := filepath.Join(destDir, filepath.Base(src))
-			name := filepath.Base(src)
-			progress.Update(copied, copiedBytes, name)
-			_, err := copyFileWithProgress(src, dst, func(delta int64) {
-				copiedBytes += delta
-				progress.Update(copied, copiedBytes, name)
-			})
-			if err != nil {
-				messageBox("复制失败：\n"+err.Error(), appName)
-				return
+	done := 0
+	var doneBytes int64
+	for _, src := range sources {
+		dst := filepath.Join(destDir, filepath.Base(src))
+		name := filepath.Base(src)
+		progress.Update(done, doneBytes, name)
+		_, err := copyFileWithProgress(src, dst, func(delta int64) {
+			doneBytes += delta
+			progress.Update(done, doneBytes, name)
+		})
+		if err != nil {
+			messageBox(mode.verb()+"失败：\n"+err.Error(), caption)
+			return
+		}
+		done++
+		progress.Update(done, doneBytes, "")
+	}
+
+	if mode == modeCut {
+		var failed []string
+		for _, src := range sources {
+			if err := os.Remove(src); err != nil {
+				failed = append(failed, filepath.Base(src)+"："+err.Error())
 			}
-			copied++
-			progress.Update(copied, copiedBytes, "")
+		}
+		if len(failed) > 0 {
+			progress.Finish(done)
+			openAndRenameFolder(destDir)
+			messageBox(fmt.Sprintf("文件已写入新文件夹，但部分源文件删除失败：\n\n%s\n\n新文件夹：%s",
+				strings.Join(failed, "\n"), destDir), caption)
+			return
 		}
 	}
 
-	progress.Finish(copied)
+	progress.Finish(done)
 	openAndRenameFolder(destDir)
-	messageBox(fmt.Sprintf("完成！\n\n配对组数：%d\n复制文件：%d\n新文件夹：%s",
-		len(pairs), copied, destDir), appName)
+	action := "复制"
+	if mode == modeCut {
+		action = "剪切（已从原位置删除）"
+	}
+	messageBox(fmt.Sprintf("完成！\n\n配对组数：%d\n%s文件：%d\n新文件夹：%s",
+		len(pairs), action, done, destDir), caption)
 }
 
 func claimSessionFile(sessionFile string) bool {
@@ -209,9 +292,16 @@ func collectArgsFiles(args []string) []string {
 	out := make([]string, 0, len(args))
 	for _, a := range args {
 		a = strings.TrimSpace(a)
-		if a != "" {
-			out = append(out, a)
+		if a == "" {
+			continue
 		}
+		low := strings.ToLower(a)
+		if low == "/copy" || low == "-copy" || low == "--copy" ||
+			low == "/cut" || low == "-cut" || low == "--cut" ||
+			low == "copy" || low == "cut" {
+			continue
+		}
+		out = append(out, a)
 	}
 	return out
 }

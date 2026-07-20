@@ -12,16 +12,20 @@ import (
 )
 
 const (
-	exeName      = "CopyPairFolder"
-	serviceName  = "复制并新建文件夹.workflow"
-	installSubdir = "CopyPairFolder"
+	exeName         = "CopyPairFolder"
+	serviceCopyName = "复制并新建文件夹.workflow"
+	serviceCutName  = "剪切并新建文件夹.workflow"
+	installSubdir   = "CopyPairFolder"
 )
 
 func helpText() string {
 	return appName + "\n\n" +
 		"双击本程序 = 安装 Finder 快速操作（右键菜单）\n" +
 		"卸载：CopyPairFolder --uninstall\n\n" +
-		"功能：仅复制「同名且同时存在 JPG 与 CR3」的配对到当前目录下的新文件夹。\n" +
+		"快速操作两项：\n" +
+		"· 「" + menuCopyCaption + "」— 配对复制到新文件夹，源文件保留\n" +
+		"· 「" + menuCutCaption + "」— 配对剪切到新文件夹，源文件删除\n\n" +
+		"仅处理「同名且同时存在 JPG 与 CR3」的配对。\n" +
 		"适用于 Apple Silicon（M3 / M4 / M5 等）。"
 }
 
@@ -31,6 +35,16 @@ func messageBox(text, caption string) {
 	script := fmt.Sprintf(`display dialog %s with title %s buttons {"好"} default button 1 with icon note`,
 		appleScriptString(text), appleScriptString(caption))
 	_ = exec.Command("osascript", "-e", script).Run()
+}
+
+func confirmDialog(text, caption string) bool {
+	script := fmt.Sprintf(`display dialog %s with title %s buttons {"取消", "继续"} default button "继续" with icon caution`,
+		appleScriptString(text), appleScriptString(caption))
+	out, err := exec.Command("osascript", "-e", script).CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "继续")
 }
 
 func appleScriptString(s string) string {
@@ -74,8 +88,12 @@ func doInstall() {
 	}
 	_ = os.Chmod(dstBin, 0755)
 
-	if err := installFinderService(dstBin); err != nil {
-		messageBox("安装失败：无法写入 Finder 服务\n"+err.Error(), appName)
+	if err := installFinderService(dstBin, serviceCopyName, menuCopyCaption, "/copy"); err != nil {
+		messageBox("安装失败：无法写入 Finder 服务（复制）\n"+err.Error(), appName)
+		os.Exit(1)
+	}
+	if err := installFinderService(dstBin, serviceCutName, menuCutCaption, "/cut"); err != nil {
+		messageBox("安装失败：无法写入 Finder 服务（剪切）\n"+err.Error(), appName)
 		os.Exit(1)
 	}
 
@@ -84,20 +102,23 @@ func doInstall() {
 	messageBox("安装成功！（Apple Silicon：M3 / M4 / M5）\n\n"+
 		"用法：\n"+
 		"1. 在 Finder 中选中 JPG / CR3\n"+
-		"2. 右键 → 快速操作 → 「"+menuCaption+"」\n"+
-		"   （若没有：右键 → 服务 → 「"+menuCaption+"」）\n\n"+
-		"若仍看不到：系统设置 → 键盘 → 键盘快捷键 → 服务，勾选该项。\n\n"+
+		"2. 右键 → 快速操作，可见两项：\n"+
+		"   · 「"+menuCopyCaption+"」\n"+
+		"   · 「"+menuCutCaption+"」\n"+
+		"   （若没有：右键 → 服务）\n\n"+
+		"若仍看不到：系统设置 → 键盘 → 键盘快捷键 → 服务，勾选这两项。\n\n"+
 		"卸载：\n"+dstBin+" --uninstall", appName)
 }
 
 func doUninstall() {
-	_ = os.RemoveAll(filepath.Join(servicesDir(), serviceName))
+	_ = os.RemoveAll(filepath.Join(servicesDir(), serviceCopyName))
+	_ = os.RemoveAll(filepath.Join(servicesDir(), serviceCutName))
 	_ = os.RemoveAll(appSupportDir())
 	_ = exec.Command("/System/Library/CoreServices/pbs", "-flush").Run()
-	messageBox("已卸载「"+menuCaption+"」。", appName)
+	messageBox("已卸载「"+menuCopyCaption+"」「"+menuCutCaption+"」。", appName)
 }
 
-func installFinderService(binPath string) error {
+func installFinderService(binPath, serviceName, caption, modeFlag string) error {
 	wfRoot := filepath.Join(servicesDir(), serviceName)
 	contents := filepath.Join(wfRoot, "Contents")
 	_ = os.RemoveAll(wfRoot)
@@ -115,7 +136,7 @@ func installFinderService(binPath string) error {
 			<key>NSMenuItem</key>
 			<dict>
 				<key>default</key>
-				<string>` + menuCaption + `</string>
+				<string>` + caption + `</string>
 			</dict>
 			<key>NSMessage</key>
 			<string>runWorkflowAsService</string>
@@ -137,8 +158,12 @@ func installFinderService(binPath string) error {
 		return err
 	}
 
-	// Automator: 接收 Finder 选中文件 → 运行 Shell
 	escapedBin := strings.ReplaceAll(binPath, `'`, `'\''`)
+	// 不同服务用不同 UUID，避免 Automator 缓存冲突（须为合法十六进制）
+	inUUID, outUUID, actUUID := "A1B2C3D4-E5F6-7890-ABCD-EF1234567890", "B2C3D4E5-F6A7-8901-BCDE-F12345678901", "C3D4E5F6-A7B8-9012-CDEF-123456789012"
+	if modeFlag == "/cut" {
+		inUUID, outUUID, actUUID = "A1B2C3D4-E5F6-7890-ABCD-EF12345678A1", "B2C3D4E5-F6A7-8901-BCDE-F123456789A2", "C3D4E5F6-A7B8-9012-CDEF-1234567890A3"
+	}
 	wflow := `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -200,7 +225,7 @@ func installFinderService(binPath string) error {
 				<key>ActionParameters</key>
 				<dict>
 					<key>COMMAND_STRING</key>
-					<string>'` + escapedBin + `' "$@" &amp;</string>
+					<string>'` + escapedBin + `' ` + modeFlag + ` "$@" &amp;</string>
 					<key>CheckedForUserDefaultShell</key>
 					<true/>
 					<key>inputMethod</key>
@@ -225,7 +250,7 @@ func installFinderService(binPath string) error {
 				<key>Class Name</key>
 				<string>RunShellScriptAction</string>
 				<key>InputUUID</key>
-				<string>A1B2C3D4-E5F6-7890-ABCD-EF1234567890</string>
+				<string>` + inUUID + `</string>
 				<key>Keywords</key>
 				<array>
 					<string>Shell</string>
@@ -235,9 +260,9 @@ func installFinderService(binPath string) error {
 					<string>Unix</string>
 				</array>
 				<key>OutputUUID</key>
-				<string>B2C3D4E5-F6A7-8901-BCDE-F12345678901</string>
+				<string>` + outUUID + `</string>
 				<key>UUID</key>
-				<string>C3D4E5F6-A7B8-9012-CDEF-123456789012</string>
+				<string>` + actUUID + `</string>
 				<key>UnlocalizedApplications</key>
 				<array>
 					<string>Automator</string>
@@ -333,7 +358,8 @@ func stateDir() string {
 	return d
 }
 
-func tryBecomeLeader(sessionFile string) bool {
+func tryBecomeLeader(sessionFile string, mode transferMode) bool {
+	_ = mode
 	if st, err := os.Stat(sessionFile); err == nil {
 		if time.Since(st.ModTime()) < sessionCooldown {
 			return false
@@ -344,7 +370,6 @@ func tryBecomeLeader(sessionFile string) bool {
 }
 
 func getSelection(hint string) []string {
-	// 快速操作会把选中文件作为参数传入；再从 Finder 取全选作补充
 	script := `
 try
 	tell application "Finder"

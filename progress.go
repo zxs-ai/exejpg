@@ -13,6 +13,7 @@ type progressWindow struct {
 	path       string
 	totalFiles int
 	totalBytes int64
+	mode       transferMode
 	lastWrite  time.Time
 	lastCopied int
 	finished   bool
@@ -20,10 +21,11 @@ type progressWindow struct {
 }
 
 func (p *progressWindow) statusText(copied int, name string) string {
+	verb := p.mode.verb()
 	if name != "" {
-		return fmt.Sprintf("正在复制  共%d张，已复制%d张  %s", p.totalFiles, copied, name)
+		return fmt.Sprintf("正在%s  共%d张，已完成%d张  %s", verb, p.totalFiles, copied, name)
 	}
-	return fmt.Sprintf("正在复制  共%d张，已复制%d张", p.totalFiles, copied)
+	return fmt.Sprintf("正在%s  共%d张，已完成%d张", verb, p.totalFiles, copied)
 }
 
 func (p *progressWindow) Update(copiedFiles int, copiedBytes int64, currentName string) {
@@ -55,7 +57,7 @@ func (p *progressWindow) Finish(copiedFiles int) {
 	p.mu.Lock()
 	if !p.finished {
 		p.lastCopied = copiedFiles
-		p.writeState(100, copiedFiles, fmt.Sprintf("复制完成  共%d张，已复制%d张", p.totalFiles, copiedFiles))
+		p.writeState(100, copiedFiles, fmt.Sprintf("%s完成  共%d张，已完成%d张", p.mode.verb(), p.totalFiles, copiedFiles))
 		p.finished = true
 	}
 	p.mu.Unlock()
